@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "TG Feiji Downloader",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "description": "Development-stage extension for more flexible downloads of accessible Telegram Web media.",
+  "action": { "default_title": "打开 Telegram 媒体侧栏", "default_popup": "popup.html" },
+  "options_page": "options.html",
+  "side_panel": { "default_path": "side-panel.html" },
+  "background": { "service_worker": "assets/background.js", "type": "module" },
+  "permissions": ["storage", "tabs", "activeTab", "sidePanel", "declarativeNetRequest"],
+  "host_permissions": [
+    "https://web.telegram.org/*",
+    "https://*.telegram.org/*",
+    "https://*.telegram-cdn.org/*",
+    "https://*.t.me/*"
+  ],
+  "content_scripts": [
+    { "matches": ["https://web.telegram.org/*"], "js": ["page-bridge.js"], "run_at": "document_start", "world": "MAIN" },
+    { "matches": ["https://web.telegram.org/*"], "js": ["assets/content.js"], "run_at": "document_end", "world": "ISOLATED" }
+  ]
+}

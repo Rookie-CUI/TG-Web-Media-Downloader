@@ -1,0 +1,56 @@
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+.nyc_output/
+.vite/
+.cache/
+.npm/
+*.tsbuildinfo
+
+# Local settings and credentials
+.env
+.env.*
+!.env.example
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs, local recordings and scratch files
+*.log
+logs/
+debug-output/
+screenshots/
+test-results/
+playwright-report/
+*.har
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*~
+tmp/
+temp/
+backups/
+
+# Local reports and archives
+reports/
+verification-*
+*整改报告*.md
+*修复报告*.md
+*验证报告*.md
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+
+# Editor and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

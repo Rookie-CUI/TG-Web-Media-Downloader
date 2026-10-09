@@ -1,0 +1,26 @@
+:root { font-family: Inter, "Segoe UI", sans-serif; color: #1d2939; background: #f6f8fb; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 340px; }
+button { border: 1px solid #d0d5dd; border-radius: 8px; background: white; color: #344054; padding: 8px 11px; cursor: pointer; white-space: nowrap; }
+button:disabled { opacity: .5; cursor: default; }
+button.primary { color: white; background: #2563eb; border-color: #2563eb; }
+.shell { min-height: 100vh; overflow: auto; padding: 16px; background: #fff; }
+.side-shell { min-width: 340px; }
+.popup-shell { width: 300px; min-height: 160px; }
+header,.toolbar,nav,.media-row,.task-row,.actions { display: flex; align-items: center; gap: 8px; }
+header { justify-content: space-between; border-bottom: 1px solid #eaecf0; padding-bottom: 12px; }
+header strong { display: block; font-size: 16px; } header small, .row-copy small, footer { color: #667085; font-size: 11px; }
+.icon { font-size: 18px; border: 0; }
+nav { margin: 12px 0; } nav button { flex: 1; padding: 8px 5px; font-size: 12px; } nav button.active { color: #1d4ed8; border-color: #93c5fd; background: #eff6ff; }
+.toolbar { justify-content: space-between; flex-wrap: wrap; padding: 8px 0; font-size: 11px; } .actions { margin-left: auto; }
+.media-row,.task-row { border-top: 1px solid #f0f2f5; padding: 10px 0; }
+.row-copy { min-width: 0; flex: 1; } .row-copy strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.row-copy small { display: block; margin-top: 4px; } .row-copy progress { width: 100%; height: 6px; margin-top: 6px; }
+.percent { font-size: 11px; min-width: 30px; } .empty,.notice { padding: 24px 8px; text-align: center; color: #667085; font-size: 13px; }
+.notice { color: #92400e; background: #fffbeb; border-radius: 8px; padding: 12px; }
+footer { border-top: 1px solid #eaecf0; padding-top: 12px; margin-top: 12px; line-height: 1.5; }
+.settings-shell { max-width: 620px; margin: 32px auto; background: #fff; padding: 28px; border-radius: 12px; box-shadow: 0 2px 12px #10182810; }
+.settings-shell p { color: #667085; margin-bottom: 24px; } .settings-shell label { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; }
+.settings-shell input[type=number] { width: 100px; padding: 7px; border: 1px solid #d0d5dd; border-radius: 6px; }
+.settings-shell label.check { justify-content: flex-start; gap: 10px; } .success { color: #15803d; margin-left: 12px; }
+.popup-shell p { color: #667085; font-size: 13px; line-height: 1.5; }
