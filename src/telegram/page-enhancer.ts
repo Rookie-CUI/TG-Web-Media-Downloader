@@ -1,21 +1,23 @@
-import { classifyMessage, detectTelegramVersion, getMessageId, messageSelector } from './adapter';
+import { detectTelegramVersion, getMessageId, messageSelector } from './adapter';
 import pageCss from './page-enhancement.css?inline';
-import { resolveAndDownloadMedia, resolveSidebarAndDownloadMedia } from './download-flow';
+import { resolveSidebarAndDownloadMedia } from './download-flow';
 import { LABELS } from '../i18n/labels';
-import { getMessageActionHost, hasDirectMessageActions } from './message-action-host';
+import { extractMessageCaption, findMessageAttachments, getMessageActionHost, hasDirectMessageActions } from './message-action-host';
 import { formatError, formatErrorLog } from '../utils/errors';
+import { runMessageDownloadSession, type AttachmentSession, type SingleDownloadCandidate } from './single-download-session';
 import type { MediaItem } from '../types';
 
 type Options = {
   openChannelMedia: () => Promise<MediaItem[]>;
-  resolve: (messageId: string, force: boolean, preferredUrl?: string) => Promise<MediaItem[]>;
+  readSingleDownloadBaseline: () => Promise<SingleDownloadCandidate[]>;
+  resolveSingleAttachment: (session: AttachmentSession, startDownload: (item: MediaItem) => Promise<void>) => Promise<MediaItem>;
   resolveSidebar: (messageId: string, preferredUrl?: string, onResolvedBeforeViewerClose?: (item: MediaItem) => Promise<void> | void) => Promise<MediaItem[]>;
   startBatch: (month?: Element) => Promise<void> | void;
   download: (item: MediaItem) => Promise<void> | void;
 };
 
 const DOWNLOAD_CLASS = 'media-download';
-const TEXT = { download: LABELS.download, image: LABELS.downloadImage, video: LABELS.downloadVideo, force: LABELS.forceDownload, month: LABELS.downloadMonth };
+const TEXT = { download: LABELS.download, month: LABELS.downloadMonth };
 
 function addText(button: HTMLButtonElement, text: string, key: string): void {
   button.innerText = text;
@@ -26,11 +28,6 @@ function addText(button: HTMLButtonElement, text: string, key: string): void {
 function stopTelegramClick(event: Event): void {
   event.stopPropagation();
   event.preventDefault();
-}
-
-function currentMessageType(message: Element): 'image' | 'video' | 'gif' | null {
-  const type = classifyMessage(message);
-  return type === 'image' || type === 'gif' || type === 'video' ? type : null;
 }
 
 function currentMediaUrl(container: Element): string | undefined {
@@ -106,102 +103,81 @@ export class TelegramPageEnhancer {
   private installMessageButtons(): void {
     const version = detectTelegramVersion();
     for (const message of Array.from(document.querySelectorAll(messageSelector()))) {
-      const kind = currentMessageType(message);
       const messageId = getMessageId(message);
-      if (!kind || !messageId) continue;
+      if (!messageId || !findMessageAttachments(message, version).length) continue;
       const wrapper = getMessageActionHost(message, version);
       if (!wrapper) continue;
       // The original Pa()/Go()/Ft() path appends to the complete message content wrapper.
       const container = wrapper;
       if (hasDirectMessageActions(container)) continue;
-      const known = [...this.items.values()].filter((item) => item.messageId === messageId && (item.kind === 'image' || item.kind === 'video' || item.kind === 'gif'));
-      const mediaCount = container.querySelectorAll('video.full-media, img.full-media, video.media-video, .media-video video, img.media-photo, .media-photo img').length;
-      const force = known.length > 1 || mediaCount > 1 || ((kind === 'video' || kind === 'gif') && !container.querySelector('video.full-media, video.media-video, .media-video video'));
-      if (version === 'K') this.createKMessageButton(container, messageId, kind, force);
-      else this.createAMessageButton(container, messageId, kind, force);
+      if (version === 'K') this.createKMessageButton(container, messageId);
+      else this.createAMessageButton(container, messageId);
     }
   }
 
-  private createAMessageButton(container: Element, messageId: string, kind: 'image' | 'video' | 'gif', force: boolean): void {
+  private createAMessageButton(container: Element, messageId: string): void {
     const action = document.createElement('div');
     action.dataset.tgMediaActions = '1';
     Object.assign(action.style, { display: 'flex', justifyContent: 'space-between' });
     const button = document.createElement('button');
     button.className = DOWNLOAD_CLASS;
     button.type = 'button';
-    Object.assign(button.style, { color: '#fff', backgroundColor: force ? '#ff6b6b' : '#1677ff', width: '50%', borderRadius: '5px', border: 'none', margin: '2px auto', cursor: 'pointer' });
-    addText(button, force ? TEXT.force : TEXT.download, force ? 'download.buttons.forceDownload' : 'download.buttons.download');
-    this.addAlbumCheckboxes(container, '.album-item-select-wrapper');
+    Object.assign(button.style, { color: '#fff', backgroundColor: '#1677ff', width: '50%', borderRadius: '5px', border: 'none', margin: '2px auto', cursor: 'pointer' });
+    addText(button, TEXT.download, 'download.buttons.download');
     button.addEventListener('click', (event) => {
       stopTelegramClick(event);
-      void this.downloadMessage(messageId, force, container).catch((error) => console.error(formatErrorLog('[TG Downloader][download] unhandled click rejection', error, { messageId })));
+      void this.downloadMessage(messageId, container).catch((error) => console.error(formatErrorLog('[TG Downloader][download] unhandled click rejection', error, { messageId })));
     });
     action.append(button);
     container.append(action);
   }
 
-  private createKMessageButton(container: Element, messageId: string, kind: 'image' | 'video' | 'gif', force: boolean): void {
+  private createKMessageButton(container: Element, messageId: string): void {
     const card = document.createElement('div');
     card.className = 'tg-k-download-actions';
     Object.assign(card.style, { maxWidth: '300px', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', gap: '16px', padding: '24px 20px', backgroundColor: 'rgba(255, 255, 255, .98)', borderRadius: '20px', backdropFilter: 'blur(20px) saturate(180%)', margin: '16px auto', transition: 'all .4s cubic-bezier(.4,0,.2,1)', boxShadow: '0 10px 40px rgba(0,0,0,.1),0 2px 8px rgba(0,0,0,.06)', border: '1px solid rgba(255,255,255,.8)', position: 'relative', overflow: 'hidden' });
     const button = document.createElement('button');
     button.className = DOWNLOAD_CLASS;
     button.type = 'button';
-    Object.assign(button.style, { color: '#fff', background: force ? 'linear-gradient(135deg,#ff6b6b,#ee5a24)' : 'linear-gradient(135deg,#667eea,#764ba2)', minWidth: '140px', height: '44px', borderRadius: '12px', border: 'none', padding: '0 20px', fontSize: '13px', fontWeight: '600', cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '.5px' });
-    addText(button, force ? TEXT.force : kind === 'image' ? TEXT.image : TEXT.video, force ? 'download.buttons.forceDownload' : kind === 'image' ? 'download.buttons.downloadImage' : 'download.buttons.downloadVideo');
-    this.addAlbumCheckboxes(container, '.album-item');
+    Object.assign(button.style, { color: '#fff', background: 'linear-gradient(135deg,#667eea,#764ba2)', minWidth: '140px', height: '44px', borderRadius: '12px', border: 'none', padding: '0 20px', fontSize: '13px', fontWeight: '600', cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '.5px' });
+    addText(button, TEXT.download, 'download.buttons.download');
     button.addEventListener('click', (event) => {
       stopTelegramClick(event);
-      void this.downloadMessage(messageId, force, container).catch((error) => console.error(formatErrorLog('[TG Downloader][download] unhandled click rejection', error, { messageId })));
+      void this.downloadMessage(messageId, container).catch((error) => console.error(formatErrorLog('[TG Downloader][download] unhandled click rejection', error, { messageId })));
     });
     card.append(button);
     container.append(card);
   }
 
-  private addAlbumCheckboxes(container: Element, selector: string): void {
-    container.querySelectorAll(selector).forEach((group) => {
-      const media = group.querySelector('video.full-media, img.full-media, video.media-video, .media-video video, img.media-photo, .media-photo img');
-      if (!media || group.querySelector('input.download-item')) return;
-      const input = document.createElement('input');
-      input.type = 'checkbox';
-      input.className = 'download-item';
-      input.name = 'downloadItem';
-      input.checked = true;
-      input.dataset.mediaUrl = (media as HTMLMediaElement).currentSrc || media.getAttribute('src') || '';
-      group.classList.add('download-checkbox-group');
-      group.append(input);
-    });
-  }
-
-  private async downloadMessage(messageId: string, force: boolean, container: Element, sidebar = false): Promise<void> {
+  private async downloadMessage(messageId: string, container: Element): Promise<void> {
     const button = container.querySelector<HTMLButtonElement>(':scope > .media-download, :scope > .tg-k-download-actions .media-download, :scope > [data-tg-media-actions="1"] .media-download');
     if (button?.dataset.tgDownloadActive === '1') return;
     if (button) { button.dataset.tgDownloadActive = '1'; button.disabled = true; }
     try {
-      if (sidebar) console.info('[TG Downloader][media-item] click', { messageId });
-      console.info(force ? '[TG Downloader][force] click' : '[TG Downloader][download] click', { messageId });
-      const checkboxes = Array.from(container.querySelectorAll<HTMLInputElement>('.download-item'));
-      const chosenUrls = checkboxes.length ? new Set(checkboxes.filter((input) => input.checked).map((input) => input.dataset.mediaUrl || '')) : undefined;
-      const chosen = sidebar
-        ? await resolveSidebarAndDownloadMedia(this.options.resolveSidebar, this.options.download, messageId, currentMediaUrl(container))
-        : await resolveAndDownloadMedia(this.options.resolve, this.options.download, messageId, force, undefined,
-          chosenUrls ? (items) => items.filter((item) => chosenUrls.has(item.url) || chosenUrls.has((item as MediaItem & { sourceUrl?: string }).sourceUrl || '')) : undefined);
-      if (sidebar) console.info('[TG Downloader][media-item] MediaItem', chosen.map((item) => ({
-        messageId: item.messageId, kind: item.kind, urlType: mediaUrlType(item.url),
-        objectUrlKind: item.objectUrlKind || 'n/a', mime: item.mimeType, size: item.size,
-      })));
-      const loggedItems = sidebar ? chosen.map((item) => ({
-        messageId: item.messageId, kind: item.kind, urlType: mediaUrlType(item.url),
-        objectUrlKind: item.objectUrlKind || 'n/a', mime: item.mimeType, size: item.size,
-        nativeDownloadStarted: item.nativeDownloadStarted === true,
-      })) : chosen;
-      console.info(force ? '[TG Downloader][force] items' : '[TG Downloader][download] items', loggedItems);
+      const message = container.closest(messageSelector());
+      if (!message) throw Object.assign(new Error('当前消息容器已失效'), { code: 'SINGLE_DOWNLOAD_MESSAGE_MISSING' });
+      const attachments = findMessageAttachments(message, detectTelegramVersion());
+      if (!attachments.length) throw Object.assign(new Error('当前消息没有可激活的媒体附件'), { code: 'SINGLE_DOWNLOAD_ATTACHMENT_MISSING' });
+      let caption = '';
+      try { caption = extractMessageCaption(message, detectTelegramVersion()); }
+      catch (error) {
+        const details = formatError(error);
+        console.warn('[TG Downloader][single-download] caption skipped', { messageId, code: details.code || details.name });
+      }
+      const result = await runMessageDownloadSession({
+        messageId, attachments, caption,
+        readBaseline: this.options.readSingleDownloadBaseline,
+        resolveAttachment: this.options.resolveSingleAttachment,
+        download: this.options.download,
+      });
+      if (result.failedCount > 0 && button) {
+        button.textContent = `${result.successCount}/${attachments.length}`;
+        window.setTimeout(() => { button.textContent = button.dataset.text || LABELS.download; }, 2400);
+      }
     } catch (error) {
       const details = formatError(error);
-      if (sidebar && /NO_MEDIA_URL/.test(details.message)) console.error(`[TG Downloader][media-item] NO_MEDIA_URL messageId=${messageId} stage=sidebar-resolve`);
-      console.error(formatErrorLog(force ? '[TG Downloader][force] failed' : '[TG Downloader][download] failed', error, {
-        messageId, stage: sidebar ? 'sidebar-resolve-or-download' : 'message-resolve-or-download',
-      }));
+      console.error('[TG Downloader][single-download] failed', { messageId, code: details.code || details.name });
+      console.error(formatErrorLog('[TG Downloader][download] failed', error, { messageId, stage: 'message-session' }));
       if (button) {
         button.textContent = LABELS.downloadFailed;
         button.dataset.tgDownloadFailed = '1';
@@ -209,6 +185,30 @@ export class TelegramPageEnhancer {
           delete button.dataset.tgDownloadFailed;
           button.textContent = button.dataset.text || LABELS.download;
         }, 2400);
+      }
+    } finally {
+      if (button) { delete button.dataset.tgDownloadActive; button.disabled = false; }
+    }
+  }
+
+  private async downloadSidebarMessage(messageId: string, container: Element): Promise<void> {
+    const button = container.querySelector<HTMLButtonElement>(':scope > .media-download');
+    if (button?.dataset.tgDownloadActive === '1') return;
+    if (button) { button.dataset.tgDownloadActive = '1'; button.disabled = true; }
+    try {
+      console.info('[TG Downloader][media-item] click', { messageId });
+      const chosen = await resolveSidebarAndDownloadMedia(this.options.resolveSidebar, this.options.download, messageId, currentMediaUrl(container));
+      console.info('[TG Downloader][media-item] MediaItem', chosen.map((item) => ({
+        messageId: item.messageId, kind: item.kind, urlType: mediaUrlType(item.url),
+        objectUrlKind: item.objectUrlKind || 'n/a', mime: item.mimeType, size: item.size,
+      })));
+    } catch (error) {
+      const details = formatError(error);
+      if (/NO_MEDIA_URL/.test(details.message)) console.error(`[TG Downloader][media-item] NO_MEDIA_URL messageId=${messageId} stage=sidebar-resolve`);
+      console.error(formatErrorLog('[TG Downloader][media-item] failed', error, { messageId, stage: 'sidebar-resolve-or-download' }));
+      if (button) {
+        button.textContent = LABELS.downloadFailed;
+        window.setTimeout(() => { button.textContent = button.dataset.text || LABELS.download; }, 2400);
       }
     } finally {
       if (button) { delete button.dataset.tgDownloadActive; button.disabled = false; }
@@ -252,7 +252,7 @@ export class TelegramPageEnhancer {
       button.addEventListener('click', (event) => {
         stopTelegramClick(event);
         const mid = container.getAttribute('data-mid') || '';
-        void this.downloadMessage(mid, true, container, true).catch((error) => console.error(formatErrorLog('[TG Downloader][media-item] unhandled click rejection', error, { messageId: mid })));
+        void this.downloadSidebarMessage(mid, container).catch((error) => console.error(formatErrorLog('[TG Downloader][media-item] unhandled click rejection', error, { messageId: mid })));
       });
     });
   }
@@ -276,7 +276,7 @@ export class TelegramPageEnhancer {
       button.addEventListener('click', (event) => {
         stopTelegramClick(event);
         const mid = entry.getAttribute('data-message-id') || entry.getAttribute('id')?.replace(/^shared-mediamessage-?/, '') || '';
-        void this.downloadMessage(mid, true, entry, true).catch((error) => console.error(formatErrorLog('[TG Downloader][media-item] unhandled click rejection', error, { messageId: mid })));
+        void this.downloadSidebarMessage(mid, entry).catch((error) => console.error(formatErrorLog('[TG Downloader][media-item] unhandled click rejection', error, { messageId: mid })));
       });
     }
   }

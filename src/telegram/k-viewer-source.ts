@@ -5,6 +5,7 @@ export interface KViewerHttpCandidate {
   label?: string;
   trustedQualityMenu?: boolean;
   trustedMediaElement?: boolean;
+  activeViewerMainMedia?: boolean;
   objectUrlKind?: string;
   capturedRealm?: string;
   createdAfterBridge?: boolean | null;
