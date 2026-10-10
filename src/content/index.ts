@@ -285,7 +285,8 @@ async function startFullHistoryScan(request: AdvancedHistoryScanRequest): Promis
 
 const pageEnhancer = new TelegramPageEnhancer({
   openChannelMedia,
-  resolve: resolveCurrent,
+  readSingleDownloadBaseline: () => resolver.readSingleDownloadBaseline(),
+  resolveSingleAttachment: (session, startDownload) => resolver.resolveSingleAttachment(session, startDownload),
   resolveSidebar: (messageId, preferredUrl, onResolvedBeforeViewerClose) => detectTelegramVersion() === 'K'
     ? resolver.resolveSidebarItem(messageId, preferredUrl, true, onResolvedBeforeViewerClose)
     : resolver.resolveForce(messageId, preferredUrl),

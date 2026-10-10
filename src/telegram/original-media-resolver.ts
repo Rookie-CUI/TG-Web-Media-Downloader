@@ -19,6 +19,12 @@ import {
 } from './k-viewer-source';
 import type { MediaItem } from '../types';
 import type { ScannedMediaIdentity } from '../types/scanned-media';
+import {
+  selectSingleDownloadCandidate,
+  singleCandidateSourceType,
+  type AttachmentSession,
+  type SingleDownloadCandidate,
+} from './single-download-session';
 
 export type OriginalMediaRecord = MediaItem & {
   monthGroup: string;
@@ -45,6 +51,7 @@ type KViewerCaptureSession = {
   viewerOpenRequestAt: number;
   bridgeStatus: KViewerBridgeStatus | null;
   bridgeInstalledBeforeViewer: boolean;
+  baselineUrls?: ReadonlySet<string>;
 };
 
 const K_SIDEBAR_SCROLL_SELECTORS = [
@@ -72,10 +79,133 @@ const A_SIDEBAR_SELECTORS = [
 const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 const PAGE_BRIDGE_MARK = '__TG_PERSONAL_MEDIA_V1__';
 
+type CardLocalStreamMetadata = { size?: number; mimeType?: string; fileName?: string };
+
+export function normalizeCardLocalMediaUrl(rawSrc: string, baseUrl = window.location.href): string {
+  try {
+    const url = new URL(rawSrc, baseUrl);
+    return ['stream', 'progressive', 'download'].includes(kViewerHttpPathClass(url.href)) ? url.href : '';
+  } catch {
+    return '';
+  }
+}
+
+export function parseCardLocalStreamMetadata(value: string): CardLocalStreamMetadata {
+  try {
+    const url = new URL(value, window.location.href);
+    const marker = '/stream/';
+    const offset = url.pathname.toLowerCase().indexOf(marker);
+    if (offset < 0) return {};
+    const raw = decodeURIComponent(url.pathname.slice(offset + marker.length));
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const size = Number(parsed.size);
+    return {
+      ...(Number.isSafeInteger(size) && size > 0 ? { size } : {}),
+      ...(typeof parsed.mimeType === 'string' && /^(video|audio)\//i.test(parsed.mimeType) ? { mimeType: parsed.mimeType } : {}),
+      ...(typeof parsed.fileName === 'string' && parsed.fileName.trim() ? { fileName: parsed.fileName } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
 function visible(element: Element): boolean {
   const rect = element.getBoundingClientRect();
   const style = getComputedStyle(element);
   return rect.width >= 8 && rect.height >= 8 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) > 0.01;
+}
+
+export type ActiveViewerMediaScope = { root: Element; ownsCurrentAttachment: boolean; reason: 'active-slide' | 'unique-visible-slide' | 'viewer-fallback' };
+
+export type ActiveViewerMediaReadyResult<T> = { kind: 'image' | 'video' | null; snapshot: T };
+
+export async function waitForActiveViewerMediaReady<T>(
+  readSnapshot: () => Promise<ActiveViewerMediaReadyResult<T>>,
+  timeoutMs = 3200,
+  pollMs = 120,
+  wait: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now: () => number = Date.now,
+): Promise<ActiveViewerMediaReadyResult<T>> {
+  const deadline = now() + timeoutMs;
+  let latest = await readSnapshot();
+  while (!latest.kind && now() < deadline) {
+    await wait(Math.min(pollMs, Math.max(0, deadline - now())));
+    latest = await readSnapshot();
+  }
+  return latest;
+}
+
+export function verifiedActiveViewerHttpImage(
+  candidate: SingleDownloadCandidate,
+  response: KViewerHttpPreflightResult,
+): SingleDownloadCandidate | null {
+  const mime = String(response.contentType || '').split(';', 1)[0].trim().toLowerCase();
+  const rangeValid = response.status !== 206 || /^bytes\s+0-\d+\/\d+$/i.test(response.contentRange || '');
+  if (!candidate.activeViewerMainMedia || candidate.kindHint !== 'image' ||
+      !allowedKViewerHttpUrl(candidate.url) || ![200, 206].includes(response.status) ||
+      !response.finalUrl || !allowedKViewerHttpUrl(response.finalUrl) || !mime.startsWith('image/') || !rangeValid) return null;
+  return { ...candidate, url: response.finalUrl, mimeType: mime, validated: true };
+}
+
+type KActiveViewerSnapshot = {
+  current: OriginalMediaRecord | null;
+  viewerImages: SingleDownloadCandidate[];
+  candidateSet: KViewerCandidateSet;
+  scopeReason: ActiveViewerMediaScope['reason'];
+  rootTag: string;
+  ownsCurrentAttachment: boolean;
+  visibleImageCount: number;
+  loadedImageCount: number;
+  visibleVideoCount: number;
+  videoWithSrcCount: number;
+  bridgeCandidateCount: number;
+  performanceCandidateCount: number;
+  mediaSourceCount: number;
+};
+
+const ACTIVE_VIEWER_SCOPE_SELECTORS = [
+  '.media-viewer-mover.active',
+  '.media-viewer-mover.is-active',
+  '.MediaViewerSlide--active',
+  '.MediaViewerSlide.active',
+  '.media-viewer-slide.active',
+  '[aria-hidden="false"].media-viewer-mover',
+];
+
+export function getActiveViewerMediaScope(viewer: Element): ActiveViewerMediaScope {
+  if (viewer.matches('img, video, source')) {
+    return { root: viewer, ownsCurrentAttachment: visible(viewer), reason: 'unique-visible-slide' };
+  }
+  for (const selector of ACTIVE_VIEWER_SCOPE_SELECTORS) {
+    const active = Array.from(viewer.querySelectorAll(selector)).find(visible);
+    if (active) return { root: active, ownsCurrentAttachment: true, reason: 'active-slide' };
+  }
+  const visibleSlides = Array.from(viewer.querySelectorAll(
+    '.media-viewer-mover, .MediaViewerSlide, .media-viewer-slide, .media-viewer-mover-wrapper',
+  )).filter(visible);
+  if (visibleSlides.length === 1) {
+    return { root: visibleSlides[0], ownsCurrentAttachment: true, reason: 'unique-visible-slide' };
+  }
+  const visibleMedia = Array.from(viewer.querySelectorAll('video, img')).filter(visible);
+  if (visibleMedia.length === 1) {
+    return { root: visibleMedia[0], ownsCurrentAttachment: true, reason: 'unique-visible-slide' };
+  }
+  return { root: viewer, ownsCurrentAttachment: false, reason: 'viewer-fallback' };
+}
+
+function viewerScopeNodes<T extends Element>(root: Element, selector: string): T[] {
+  const nodes = [
+    ...(root.matches(selector) ? [root as T] : []),
+    ...Array.from(root.querySelectorAll<T>(selector)),
+  ];
+  return [...new Set(nodes)];
+}
+
+function activeViewerHasVideo(viewer: Element): boolean {
+  const scope = getActiveViewerMediaScope(viewer);
+  const videos = viewerScopeNodes(scope.root, 'video').filter(visible);
+  if (videos.length === 1) return true;
+  return scope.ownsCurrentAttachment && Boolean(scope.root.querySelector('source[type^="video/"], video source[src]'));
 }
 
 function mediaUrl(node: Element): string {
@@ -607,6 +737,529 @@ export class TelegramMediaResolver {
     });
   }
 
+  async readSingleDownloadBaseline(): Promise<SingleDownloadCandidate[]> {
+    return (await this.readRecentPageMediaUrls(0)).map((candidate) => ({
+      url: candidate.url,
+      source: candidate.source || 'bridge',
+      capturedAt: candidate.capturedAt || 0,
+      mimeType: candidate.contentType || '',
+      objectUrlKind: candidate.objectUrlKind as MediaItem['objectUrlKind'],
+      origin: 'bridge' as const,
+    }));
+  }
+
+  private async waitForKActiveViewerMediaReady(
+    viewer: Element,
+    original: OriginalMediaRecord,
+    session: AttachmentSession,
+    forcedVideoIntent = false,
+  ): Promise<ActiveViewerMediaReadyResult<KActiveViewerSnapshot>> {
+    const preflightCache = new Map<string, KViewerHttpPreflightResult>();
+    const preflight = async (candidate: KViewerHttpCandidate) => {
+      let response = preflightCache.get(candidate.url);
+      if (!response) {
+        response = await this.preflightKViewerHttpCandidate(candidate);
+        preflightCache.set(candidate.url, response);
+      }
+      return response;
+    };
+    return waitForActiveViewerMediaReady(async () => {
+      const scope = getActiveViewerMediaScope(viewer);
+      const visibleImages = viewerScopeNodes<HTMLImageElement>(scope.root, 'img')
+        .filter((image) => visible(image) && !image.closest('.spoilers-container, .media-spoiler'));
+      const visibleVideos = viewerScopeNodes<HTMLVideoElement>(scope.root, 'video').filter(visible);
+      const current = this.readKViewerMedia(viewer, original);
+      const candidateSet = await this.readKViewerCandidateSet(viewer, session.startedAt, false, session.baselineUrls);
+      const allCandidates = [...candidateSet.menu, ...candidateSet.viewer, ...candidateSet.captured, ...candidateSet.performance];
+      const mediaSourceCount = allCandidates.filter((candidate) => candidate.objectUrlKind === 'media-source').length;
+      const videoWithSrcCount = visibleVideos.filter((video) => Boolean(mediaUrl(video))).length;
+      const directVideoEvidence = forcedVideoIntent || activeViewerHasVideo(viewer) || current?.kind === 'video' || mediaSourceCount > 0 ||
+        allCandidates.some((candidate) => /^(video|audio)\//i.test(candidate.contentType || ''));
+      let verifiedVideoEvidence = false;
+      if (!directVideoEvidence) {
+        const httpVideo = allCandidates.find((candidate) => allowedKViewerHttpUrl(candidate.url) &&
+          /\/(progressive|stream|download)\//i.test(candidate.url));
+        if (httpVideo) {
+          const response = await preflight(httpVideo);
+          verifiedVideoEvidence = !kViewerProbeRejectReason(response);
+        }
+      }
+
+      const rawImages = this.readSingleViewerImages(viewer, session.attachmentIndex, directVideoEvidence || verifiedVideoEvidence, false);
+      const viewerImages: SingleDownloadCandidate[] = [];
+      for (const image of rawImages) {
+        if (image.url.startsWith('blob:')) {
+          viewerImages.push(image);
+          continue;
+        }
+        if (!allowedKViewerHttpUrl(image.url)) continue;
+        const response = await preflight({ url: image.url, source: 'active-viewer-image', activeViewerMainMedia: true });
+        const verified = verifiedActiveViewerHttpImage(image, response);
+        if (verified) viewerImages.push(verified);
+      }
+
+      const snapshot: KActiveViewerSnapshot = {
+        current,
+        viewerImages,
+        candidateSet,
+        scopeReason: scope.reason,
+        rootTag: scope.root.tagName.toLowerCase(),
+        ownsCurrentAttachment: scope.ownsCurrentAttachment,
+        visibleImageCount: visibleImages.length,
+        loadedImageCount: visibleImages.filter((image) => image.naturalWidth > 0 && image.naturalHeight > 0).length,
+        visibleVideoCount: visibleVideos.length,
+        videoWithSrcCount,
+        bridgeCandidateCount: candidateSet.captured.length,
+        performanceCandidateCount: candidateSet.performance.length,
+        mediaSourceCount,
+      };
+      if (directVideoEvidence || verifiedVideoEvidence) return { kind: 'video' as const, snapshot };
+      if (viewerImages.length) return { kind: 'image' as const, snapshot };
+      return { kind: null, snapshot };
+    }, 3200, 120, (ms) => sleep(ms).then(() => undefined));
+  }
+
+  private cardHasVideoIntent(attachment: Element): boolean {
+    if (attachment.matches('video, .media-video, .video-time, .video-play') ||
+        attachment.querySelector('video, .media-video, .video-time, .video-play')) return true;
+    return this.readCardLocalVideoSources(attachment).length > 0;
+  }
+
+  private readCardLocalVideoSources(attachment: Element): KViewerHttpCandidate[] {
+    const videos = [
+      ...(attachment.matches('video') ? [attachment as HTMLVideoElement] : []),
+      ...Array.from(attachment.querySelectorAll<HTMLVideoElement>('video')),
+    ];
+    const sources = [
+      ...(attachment.matches('source[src]') ? [attachment as HTMLSourceElement] : []),
+      ...Array.from(attachment.querySelectorAll<HTMLSourceElement>('video source[src]')),
+    ];
+    const candidates: KViewerHttpCandidate[] = [];
+    for (const video of videos) {
+      const contentType = video.getAttribute('type') || video.getAttribute('data-mime-type') || '';
+      for (const rawSrc of [video.currentSrc, video.getAttribute('src') || '']) {
+        const url = normalizeCardLocalMediaUrl(rawSrc);
+        if (url) candidates.push({ url, source: 'card-local', contentType, trustedMediaElement: true });
+      }
+    }
+    for (const source of sources) {
+      const url = normalizeCardLocalMediaUrl(source.getAttribute('src') || '');
+      if (url) candidates.push({
+        url, source: 'card-local', contentType: source.getAttribute('type') || source.getAttribute('data-mime-type') || '',
+        trustedMediaElement: true,
+      });
+    }
+    return [...new Map(candidates.map((candidate) => [candidate.url, candidate])).values()];
+  }
+
+  private async resolveCardLocalVideo(
+    attachment: Element,
+    original: OriginalMediaRecord,
+    session: AttachmentSession,
+  ): Promise<OriginalMediaRecord | null> {
+    const candidates = this.readCardLocalVideoSources(attachment);
+    if (!candidates.length) {
+      console.info('[TG Downloader][single-download] card-source', {
+        attachmentIndex: session.attachmentIndex, sourceType: 'none', owned: true, preflight: 'not-run',
+      });
+      return null;
+    }
+    for (const candidate of candidates) {
+      const response = await this.preflightKViewerHttpCandidate(candidate);
+      const sourceType = kViewerHttpPathClass(candidate.url);
+      const streamRejected = sourceType === 'stream' &&
+        (response.standalonePlayable !== true || response.fragmented === true);
+      const rejected = kViewerProbeRejectReason(response) || (streamRejected ? response.containerRejectReason || 'MEDIA_CONTAINER_NOT_STANDALONE' : '');
+      console.info('[TG Downloader][single-download] card-source', {
+        attachmentIndex: session.attachmentIndex, sourceType, owned: true, preflight: rejected ? 'fail' : 'pass',
+      });
+      if (rejected || !response.finalUrl) continue;
+      const metadata = parseCardLocalStreamMetadata(candidate.url);
+      const mimeType = (response.contentType || metadata.mimeType || original.mimeType).split(';', 1)[0].trim();
+      const resolvedAt = Date.now();
+      return enrichCapturedMedia({
+        ...original,
+        id: `${session.messageId}:${response.finalUrl}`,
+        url: response.finalUrl,
+        filename: safeFilename(metadata.fileName || filenameFromUrl(response.finalUrl, 'video')),
+        mimeType,
+        size: metadata.size || (response.status === 200 ? Number(response.contentLength) || 0 : 0),
+        kind: 'video' as const,
+        source: 'fetch' as const,
+        capturedAt: resolvedAt,
+        requiresPageTransport: true,
+        kSingleVideo: { viewerOpenMs: 0, candidateDiscoveryMs: 0, probeMs: 0, resolvedAt },
+      });
+    }
+    return null;
+  }
+
+  private async activateCardLocalVideo(
+    attachment: Element,
+    original: OriginalMediaRecord,
+    session: AttachmentSession,
+  ): Promise<OriginalMediaRecord | null> {
+    const play = attachment.matches('.video-play') ? attachment as HTMLElement : attachment.querySelector<HTMLElement>('.video-play');
+    if (!play) {
+      console.info('[TG Downloader][single-download] card-video-activate', {
+        attachmentIndex: session.attachmentIndex, playButtonFound: false, videoAppeared: false, sourceAppeared: false,
+      });
+      return null;
+    }
+    const attemptedUrls = new Set(this.readCardLocalVideoSources(attachment).map((candidate) => candidate.url));
+    play.click();
+    const deadline = Date.now() + 2800;
+    let videoAppeared = false;
+    let resolved: OriginalMediaRecord | null = null;
+    while (Date.now() < deadline) {
+      videoAppeared ||= attachment.matches('video') || Boolean(attachment.querySelector('video'));
+      const sources = this.readCardLocalVideoSources(attachment);
+      if (sources.some((candidate) => !attemptedUrls.has(candidate.url))) {
+        resolved = await this.resolveCardLocalVideo(attachment, original, session);
+        sources.forEach((candidate) => attemptedUrls.add(candidate.url));
+        if (resolved) break;
+      }
+      await sleep(120);
+    }
+    console.info('[TG Downloader][single-download] card-video-activate', {
+      attachmentIndex: session.attachmentIndex,
+      playButtonFound: true,
+      videoAppeared,
+      sourceAppeared: Boolean(resolved || this.readCardLocalVideoSources(attachment).length),
+    });
+    return resolved;
+  }
+
+  async resolveSingleAttachment(
+    session: AttachmentSession,
+    onResolvedBeforeViewerClose: (item: MediaItem) => Promise<void>,
+  ): Promise<OriginalMediaRecord> {
+    const version = detectTelegramVersion();
+    const message = session.activationElement.closest(messageSelector()) || session.activationElement;
+    const mediaNode = session.activationElement.matches('img, video, canvas, source')
+      ? session.activationElement
+      : session.activationElement.querySelector('video, img, canvas, source') || session.activationElement;
+    const initialUrl = mediaUrl(mediaNode);
+    const original: OriginalMediaRecord = recordFromNode(mediaNode, message, { fallbackUrl: initialUrl || undefined }) || {
+      id: `${session.messageId}:attachment-${session.attachmentIndex}`,
+      url: initialUrl,
+      filename: `telegram-media-${session.messageId}-${session.attachmentIndex + 1}.bin`,
+      mimeType: 'application/octet-stream',
+      size: 0,
+      kind: 'file',
+      messageId: session.messageId,
+      peerId: activePeerId(),
+      fileId: '',
+      source: 'dom',
+      capturedAt: session.startedAt,
+      monthGroup: '',
+      hasDownloaded: false,
+    };
+    original.messageId = session.messageId;
+    const videoIntent = this.cardHasVideoIntent(session.activationElement);
+    const directCardVideo = await this.resolveCardLocalVideo(session.activationElement, original, session);
+    if (directCardVideo) {
+      await onResolvedBeforeViewerClose(directCardVideo);
+      return directCardVideo;
+    }
+    if (videoIntent) {
+      const activatedCardVideo = await this.activateCardLocalVideo(session.activationElement, original, session);
+      if (activatedCardVideo) {
+        await onResolvedBeforeViewerClose(activatedCardVideo);
+        return activatedCardVideo;
+      }
+    }
+    const bridgeStatus = await this.readPageBridgeStatus();
+    const captureSession: KViewerCaptureSession = {
+      viewerOpenRequestAt: session.startedAt,
+      bridgeStatus,
+      bridgeInstalledBeforeViewer: Boolean(bridgeStatus && bridgeStatus.bridgeInstalledAt <= session.startedAt),
+      baselineUrls: session.baselineUrls,
+    };
+    let viewer: Element | null = null;
+    let closed = false;
+    const close = async () => {
+      if (!viewer || closed) return;
+      const didClose = await this.closeViewer(version, viewer);
+      if (didClose) {
+        closed = true;
+        return;
+      }
+      const error = Object.assign(new Error('Viewer 关闭操作后仍保持可见'), { code: 'SINGLE_DOWNLOAD_VIEWER_CLOSE_FAILED' });
+      console.error(formatErrorLog('[TG Downloader][single-download] viewer-close-failed', error, {
+        messageId: session.messageId,
+        attachmentIndex: session.attachmentIndex,
+        scope: version === 'K' ? 'media-viewer-whole' : 'MediaViewer',
+      }));
+      throw error;
+    };
+    console.info('[TG Downloader][single-download] activate', {
+      messageId: session.messageId, sessionId: session.sessionId,
+      attachmentIndex: session.attachmentIndex, attachmentKey: session.attachmentKey,
+    });
+    try {
+      const target = session.activationElement.querySelector<HTMLElement>('.media-inner, .media-photo, .media-video') ||
+        session.activationElement as HTMLElement;
+      target.click();
+      viewer = await this.waitForViewer(version, 3000);
+      console.info('[TG Downloader][single-download] viewer/player-active', {
+        messageId: session.messageId, sessionId: session.sessionId,
+        attachmentIndex: session.attachmentIndex, active: Boolean(viewer),
+      });
+      if (!viewer) {
+        throw Object.assign(new Error('附件激活后未出现 Viewer'), { code: 'SINGLE_DOWNLOAD_VIEWER_TIMEOUT' });
+      }
+
+      const readiness = version === 'K' ? await this.waitForKActiveViewerMediaReady(viewer, original, session, videoIntent) : null;
+      const activeViewerMedia = readiness?.snapshot.current ||
+        (version === 'K' ? this.readKViewerMedia(viewer, original) : this.readViewerMedia(viewer, original));
+      const viewerHasActiveVideo = readiness?.kind === 'video' || activeViewerHasVideo(viewer) || activeViewerMedia?.kind === 'video';
+      if (version === 'K' && viewerHasActiveVideo) {
+        const resolved = await this.resolveKViewerSidebarVideo(viewer, original, captureSession, { allowNativeFallback: false });
+        console.info('[TG Downloader][single-download] source-selected', {
+          messageId: session.messageId, sessionId: session.sessionId, attachmentIndex: session.attachmentIndex,
+          sourceType: singleCandidateSourceType(resolved), mime: resolved.mimeType || '', route: 'k-single-video',
+        });
+        await onResolvedBeforeViewerClose(resolved);
+        await close();
+        return resolved;
+      }
+
+      const preflightCache = new Map<string, KViewerHttpPreflightResult>();
+      const firstWait = version === 'K'
+        ? {
+            candidate: null,
+            polls: 1,
+            weakCandidateCount: 0,
+            rejectedCandidates: [],
+            ...(readiness?.snapshot.candidateSet || { menu: [], viewer: [], captured: [], performance: [] }),
+          }
+        : await waitForKViewerHttpSource(
+          () => this.readKViewerCandidateSet(viewer!, session.startedAt, false, session.baselineUrls),
+          2800,
+          120,
+          (ms) => sleep(ms).then(() => undefined),
+          (candidate) => this.preflightKViewerHttpCandidate(candidate),
+          preflightCache,
+        );
+      const viewerHasVideo = version === 'K' ? false : viewerHasActiveVideo ||
+        [...firstWait.captured, ...firstWait.viewer, ...firstWait.performance].some((candidate) =>
+          candidate.objectUrlKind === 'media-source' || /^(video|audio)\//i.test(candidate.contentType || '') ||
+          /\/(progressive|stream|download)\//i.test(candidate.url));
+      const candidates: SingleDownloadCandidate[] = [];
+      if (firstWait.candidate) {
+        candidates.push({
+          url: firstWait.candidate.url,
+          source: firstWait.candidate.source || 'page-capture',
+          capturedAt: firstWait.candidate.capturedAt || Date.now(),
+          mimeType: firstWait.candidate.verifiedContentType || firstWait.candidate.contentType || '',
+          objectUrlKind: firstWait.candidate.objectUrlKind as MediaItem['objectUrlKind'],
+          origin: firstWait.candidate.source === 'performance-resource' ? 'performance' : 'bridge',
+          validated: true,
+          activeViewerMainMedia: firstWait.candidate.activeViewerMainMedia === true || firstWait.candidate.trustedQualityMenu === true,
+        });
+      }
+      const viewerScope = getActiveViewerMediaScope(viewer);
+      const viewerImages = readiness?.snapshot.viewerImages ||
+        this.readSingleViewerImages(viewer, session.attachmentIndex, viewerHasVideo);
+      for (const image of viewerImages) console.info('[TG Downloader][single-download] viewer-image-candidate', {
+        attachmentIndex: session.attachmentIndex,
+        hasUrl: Boolean(image.url),
+        urlType: image.url.startsWith('blob:') ? 'blob' : /^https?:/i.test(image.url) ? 'http' : 'other',
+        mime: image.mimeType || '',
+        naturalWidth: image.width || 0,
+        naturalHeight: image.height || 0,
+        activeViewerMainMedia: image.activeViewerMainMedia === true,
+        kindHint: image.kindHint || 'n/a',
+      });
+      const imageCount = viewerScopeNodes<HTMLElement>(viewerScope.root, 'img').filter(visible).length;
+      const videoCount = viewerScopeNodes<HTMLElement>(viewerScope.root, 'video').filter(visible).length;
+      console.info('[TG Downloader][single-download] active-scope', {
+        messageId: session.messageId,
+        attachmentIndex: session.attachmentIndex,
+        scopeReason: viewerScope.reason,
+        rootTag: viewerScope.root.tagName.toLowerCase(),
+        ownsCurrentAttachment: viewerScope.ownsCurrentAttachment,
+        imageCount,
+        videoCount,
+      });
+      for (const image of viewerImages) candidates.push(image);
+      const current = activeViewerMedia || (version === 'K' ? null : this.readViewerMedia(viewer, original));
+      let imageAdoptFailure: PinnedViewerBlob | undefined;
+      if (current?.url.startsWith('blob:')) {
+        const captured = firstWait.captured.find((candidate) => candidate.url === current.url);
+        if (captured?.objectUrlKind === 'media-source') {
+          candidates.push({
+            url: current.url, source: captured.source || 'object-url', capturedAt: captured.capturedAt || Date.now(),
+            mimeType: captured.contentType || current.mimeType, objectUrlKind: 'media-source', origin: 'bridge',
+            trustedMainMedia: true, activeViewerMainMedia: true,
+          });
+        } else {
+          const pinned = await this.pinKViewerBlob(current.url, session.messageId, captureSession);
+          if (pinned.ok && pinned.leaseId && pinned.objectUrlKind === 'blob' && Number(pinned.size) > 0) {
+            candidates.push({
+              url: current.url, source: 'pinned-blob', capturedAt: Date.now(), mimeType: pinned.mimeType || current.mimeType,
+              objectUrlKind: 'blob', origin: 'viewer', trustedMainMedia: true, activeViewerMainMedia: true,
+              ...(current.kind === 'image' ? { kindHint: 'image' as const } : {}), validated: true,
+            });
+            current.blobLeaseId = pinned.leaseId;
+            current.objectUrlKind = 'blob';
+            current.size = Number(pinned.size) || current.size;
+            current.mimeType = pinned.mimeType || current.mimeType;
+          } else if (pinned.objectUrlKind === 'media-source') {
+            candidates.push({
+              url: current.url, source: 'object-url', capturedAt: Date.now(), mimeType: pinned.mimeType || '',
+              objectUrlKind: 'media-source', origin: 'viewer', trustedMainMedia: true, activeViewerMainMedia: true,
+            });
+          } else {
+            const activeImage = viewerImages.find((image) => image.url === current.url &&
+              image.activeViewerMainMedia === true && image.kindHint === 'image');
+            if (activeImage && viewerScope.ownsCurrentAttachment && !viewerHasVideo && current.kind === 'image') {
+              const adopted = await this.adoptActiveImageBlob(current.url, session.messageId, session.attachmentIndex);
+              console.info('[TG Downloader][single-download] image-blob-adopt', {
+                attachmentIndex: session.attachmentIndex,
+                adopt: adopted.ok ? 'pass' : 'fail',
+                size: Number(adopted.size) || 0,
+                mime: adopted.mimeType || '',
+                code: adopted.code || 'n/a',
+              });
+              if (adopted.ok && adopted.leaseId && adopted.objectUrlKind === 'blob' && Number(adopted.size) > 0) {
+                candidates.push({
+                  ...activeImage,
+                  source: 'pinned-blob',
+                  capturedAt: Date.now(),
+                  mimeType: adopted.mimeType || activeImage.mimeType,
+                  objectUrlKind: 'blob',
+                  validated: true,
+                });
+                current.blobLeaseId = adopted.leaseId;
+                current.objectUrlKind = 'blob';
+                current.size = Number(adopted.size) || 0;
+                current.mimeType = adopted.mimeType || current.mimeType;
+              } else {
+                imageAdoptFailure = adopted;
+              }
+            }
+          }
+        }
+      }
+
+      console.info('[TG Downloader][single-download] candidates', {
+        messageId: session.messageId, sessionId: session.sessionId, attachmentIndex: session.attachmentIndex,
+        count: firstWait.menu.length + firstWait.viewer.length + firstWait.captured.length + firstWait.performance.length + viewerImages.length,
+        sourceTypes: [...new Set([
+          ...candidates.map((candidate) => singleCandidateSourceType(candidate)),
+          ...firstWait.menu.map((candidate) => kViewerHttpPathClass(candidate.url)),
+          ...firstWait.viewer.map((candidate) => kViewerHttpPathClass(candidate.url)),
+          ...firstWait.captured.map((candidate) => candidate.objectUrlKind === 'media-source' ? 'media-source' :
+            candidate.url.startsWith('blob:') ? 'blob' : kViewerHttpPathClass(candidate.url)),
+          ...firstWait.performance.map((candidate) => kViewerHttpPathClass(candidate.url)),
+        ])],
+      });
+      for (const rejection of firstWait.rejectedCandidates) {
+        console.info('[TG Downloader][single-download] candidate-rejected', {
+          messageId: session.messageId, sessionId: session.sessionId, attachmentIndex: session.attachmentIndex,
+          reason: rejection.code, sourceType: rejection.source || 'unknown', mime: rejection.contentType || '',
+        });
+      }
+      let decision = selectSingleDownloadCandidate(candidates, session, viewerHasVideo);
+      for (const rejection of decision.rejected) {
+        console.info('[TG Downloader][single-download] candidate-rejected', {
+          messageId: session.messageId, sessionId: session.sessionId, attachmentIndex: session.attachmentIndex,
+          reason: rejection.reason, sourceType: singleCandidateSourceType(rejection.candidate), mime: rejection.candidate.mimeType || '',
+        });
+      }
+
+      if (!decision.selected || !decision.kind) {
+        const rejectedReasons = decision.rejected.reduce<Record<string, number>>((counts, rejection) => {
+          counts[rejection.reason] = (counts[rejection.reason] || 0) + 1;
+          return counts;
+        }, {});
+        const snapshot = readiness?.snapshot;
+        console.error('[TG Downloader][single-download] unresolved-summary ' + [
+          `messageId=${session.messageId}`,
+          `attachmentIndex=${session.attachmentIndex}`,
+          `version=${version}`,
+          'viewerFound=true',
+          `scopeReason=${snapshot?.scopeReason || viewerScope.reason}`,
+          `rootTag=${snapshot?.rootTag || viewerScope.root.tagName.toLowerCase()}`,
+          `ownsCurrentAttachment=${snapshot?.ownsCurrentAttachment ?? viewerScope.ownsCurrentAttachment}`,
+          `visibleImageCount=${snapshot?.visibleImageCount ?? imageCount}`,
+          `loadedImageCount=${snapshot?.loadedImageCount ?? viewerImages.length}`,
+          `visibleVideoCount=${snapshot?.visibleVideoCount ?? videoCount}`,
+          `videoWithSrcCount=${snapshot?.videoWithSrcCount ?? 0}`,
+          `bridgeCandidateCount=${snapshot?.bridgeCandidateCount ?? firstWait.captured.length}`,
+          `performanceCandidateCount=${snapshot?.performanceCandidateCount ?? firstWait.performance.length}`,
+          `mediaSourceCount=${snapshot?.mediaSourceCount ?? 0}`,
+          `acceptedCandidateCount=${Math.max(0, candidates.length - decision.rejected.length)}`,
+          `rejectedReasons=${JSON.stringify(rejectedReasons)}`,
+        ].join(' '));
+        const code = imageAdoptFailure?.code || 'SINGLE_DOWNLOAD_SOURCE_UNRESOLVED';
+        throw Object.assign(new Error(imageAdoptFailure?.error || '当前附件没有可验证的媒体来源'), { code });
+      }
+      const selected = decision.selected;
+      const resolved: OriginalMediaRecord = enrichCapturedMedia({
+        ...original,
+        id: `${session.messageId}:${selected.url}`,
+        url: selected.url,
+        filename: safeFilename(filenameFromUrl(selected.url, decision.kind)),
+        mimeType: selected.mimeType || original.mimeType,
+        kind: decision.kind,
+        source: selected.url.startsWith('blob:') ? 'blob' : selected.origin === 'viewer' ? 'dom' : 'fetch',
+        capturedAt: selected.capturedAt,
+        objectUrlKind: selected.objectUrlKind,
+        blobLeaseId: selected.url === current?.url ? current?.blobLeaseId : undefined,
+        size: selected.url === current?.url ? current?.size || 0 : 0,
+      });
+      console.info('[TG Downloader][single-download] source-selected', {
+        messageId: session.messageId, sessionId: session.sessionId, attachmentIndex: session.attachmentIndex,
+        sourceType: singleCandidateSourceType(selected), mime: resolved.mimeType || '',
+      });
+      await onResolvedBeforeViewerClose(resolved);
+      await close();
+      return resolved;
+    } finally {
+      await close();
+    }
+  }
+
+  private readSingleViewerImages(
+    viewer: Element,
+    attachmentIndex = -1,
+    viewerHasVideo = false,
+    logCandidates = true,
+  ): SingleDownloadCandidate[] {
+    const scope = getActiveViewerMediaScope(viewer);
+    return viewerScopeNodes<HTMLImageElement>(scope.root, 'img').flatMap((image) => {
+      if (!visible(image)) return [];
+      const url = image.currentSrc || image.src || image.getAttribute('src') || '';
+      const mime = image.getAttribute('type') || image.getAttribute('data-mime-type') ||
+        (/\.png(?:$|[?#])/i.test(url) ? 'image/png' : /\.webp(?:$|[?#])/i.test(url) ? 'image/webp' :
+          /\.gif(?:$|[?#])/i.test(url) ? 'image/gif' : /\.jpe?g(?:$|[?#])/i.test(url) ? 'image/jpeg' : '');
+      const mainImage = scope.ownsCurrentAttachment && !image.closest('.spoilers-container, .media-spoiler') &&
+        (image.naturalWidth || 0) > 0 && (image.naturalHeight || 0) > 0 && !viewerHasVideo;
+      if (logCandidates) console.info('[TG Downloader][single-download] viewer-image-candidate', {
+          attachmentIndex,
+          hasUrl: Boolean(url),
+          urlType: url.startsWith('blob:') ? 'blob' : /^https?:/i.test(url) ? 'http' : 'other',
+          mime: mime || '',
+          naturalWidth: image.naturalWidth || 0,
+          naturalHeight: image.naturalHeight || 0,
+          activeViewerMainMedia: mainImage,
+          kindHint: mainImage ? 'image' : 'n/a',
+        });
+      if (!url || !mainImage) return [];
+      return [{
+        url, source: 'viewer-image', capturedAt: Date.now(), mimeType: mime,
+        origin: 'viewer' as const,
+        trustedMainMedia: true,
+        activeViewerMainMedia: true,
+        kindHint: 'image' as const,
+        width: image.naturalWidth || image.width || 0, height: image.naturalHeight || image.height || 0,
+      }];
+    });
+  }
+
   async resolveMessage(messageId: string, preferredUrl?: string): Promise<OriginalMediaRecord[]> {
     let message = Array.from(document.querySelectorAll(messageSelector())).find((node) => getMessageId(node) === messageId) || null;
     let nodes = message ? mediaElements(message) : [];
@@ -748,11 +1401,11 @@ export class TelegramMediaResolver {
             });
             return onResolvedBeforeViewerClose?.(candidate);
           },
-          () => {
+          async () => {
             console.info('[TG Downloader][viewer] close', {
               messageId, finalUrlType: urlType(finalUrlBeforeClose), objectUrlKind: finalObjectUrlKindBeforeClose || 'n/a',
             });
-            return this.closeViewer(version, viewer);
+            await this.closeViewer(version, viewer);
           },
         );
         output.push(enrichCapturedMedia(completed));
@@ -768,7 +1421,7 @@ export class TelegramMediaResolver {
           if (expectedKind === 'image') console.info('[TG Downloader][image-viewer] resolved', { messageId, urlType: urlType(finalItem.url), mime: finalItem.mimeType, size: finalItem.size || 0 });
           if (onResolvedBeforeViewerClose) return onResolvedBeforeViewerClose(finalItem);
         },
-        () => {
+        async () => {
           if (options.pinKViewerVideo && sidebarContainer && expectedKind === 'video') {
             console.info('[TG Downloader][viewer] close', {
               messageId, finalUrlType: urlType(finalUrlBeforeClose), objectUrlKind: finalObjectUrlKindBeforeClose || 'n/a',
@@ -776,7 +1429,7 @@ export class TelegramMediaResolver {
           } else {
             console.info('[TG Downloader][viewer] close', { messageId, finalUrl: finalUrlBeforeClose || undefined });
           }
-          return this.closeViewer(version, viewer);
+          await this.closeViewer(version, viewer);
         },
       );
       if (!resolved) {
@@ -993,22 +1646,41 @@ export class TelegramMediaResolver {
     return movers ? movers.closest('.media-viewer-whole') || movers : null;
   }
 
-  private async closeViewer(version: 'A' | 'K' | 'unknown', viewer: Element): Promise<void> {
-    if (version === 'K') {
-      const buttons = Array.from(viewer.querySelectorAll<HTMLElement>('.media-viewer-buttons .btn-icon'))
-        .filter((node) => visible(node) && !node.classList.contains('btn-menu-toggle') && !node.classList.contains('quality-download-options-button-menu'));
-      const close = buttons.find((node) => /close|back/i.test(`${node.title} ${node.getAttribute('aria-label') || ''}`)) || buttons.at(-1);
-      close?.click();
-      const deadline = Date.now() + 1500;
-      while (Date.now() < deadline && document.querySelector('.media-viewer-whole.active, .media-viewer-whole.is-visible')) await sleep(100);
-      return;
-    }
-    const close = viewer.querySelector<HTMLElement>('.MediaViewerClose, [aria-label*="close" i], .close');
-    close?.click();
-    if (!close) {
-      const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
-      viewer.dispatchEvent(escape);
-    }
+  private async closeViewer(version: 'A' | 'K' | 'unknown', viewer: Element): Promise<boolean> {
+    const activeViewer = () => version === 'K'
+      ? document.querySelector('.media-viewer-whole.active, .media-viewer-whole.is-visible')
+      : document.querySelector('.MediaViewer, .MediaViewer.active');
+    const isOpen = () => {
+      const active = activeViewer();
+      if (active) return visible(active);
+      return viewer.isConnected !== false && visible(viewer);
+    };
+    const waitUntilClosed = async (timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (isOpen() && Date.now() < deadline) await sleep(80);
+      return !isOpen();
+    };
+    const closeButton = () => {
+      if (version === 'K') {
+        const buttons = Array.from(viewer.querySelectorAll<HTMLElement>(
+          '.media-viewer-buttons .btn-icon, .MediaViewerClose, [aria-label*="close" i], [aria-label*="back" i]',
+        )).filter((node) => visible(node) && !node.classList.contains('btn-menu-toggle') &&
+          !node.classList.contains('quality-download-options-button-menu'));
+        return buttons.find((node) => /close|back/i.test(`${node.title} ${node.getAttribute('aria-label') || ''}`)) ||
+          viewer.querySelector<HTMLElement>('.MediaViewerClose, .media-viewer-close, [data-action="close"], [aria-label*="close" i], [aria-label*="back" i]');
+      }
+      return viewer.querySelector<HTMLElement>('.MediaViewerClose, [aria-label*="close" i], .close');
+    };
+    const firstClose = closeButton();
+    firstClose?.click();
+    if (await waitUntilClosed(600)) return true;
+
+    const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+    (document.activeElement || viewer).dispatchEvent(escape);
+    if (await waitUntilClosed(600)) return true;
+
+    closeButton()?.click();
+    return waitUntilClosed(600);
   }
 
   private readViewerMedia(viewer: Element, original: OriginalMediaRecord): OriginalMediaRecord | null {
@@ -1055,6 +1727,7 @@ export class TelegramMediaResolver {
     viewer: Element,
     original: OriginalMediaRecord,
     session: KViewerCaptureSession,
+    options: { allowNativeFallback?: boolean } = {},
   ): Promise<OriginalMediaRecord> {
     const discoveryStartedAt = Date.now();
     const viewerOpenMs = Math.max(0, discoveryStartedAt - session.viewerOpenRequestAt);
@@ -1105,7 +1778,7 @@ export class TelegramMediaResolver {
       });
     };
     const firstWait = await waitForKViewerHttpSource(
-      () => this.readKViewerCandidateSet(viewer, session.viewerOpenRequestAt, openedByToggle),
+      () => this.readKViewerCandidateSet(viewer, session.viewerOpenRequestAt, openedByToggle, session.baselineUrls),
       1200,
       80,
       (ms) => sleep(ms).then(() => undefined),
@@ -1165,13 +1838,15 @@ export class TelegramMediaResolver {
         const pinned = await tryPinCurrentBlob();
         if (pinned) return pinned;
 
-        // Existing/captured sources get the fast path without opening a menu first.
-        // Longer discovery is reserved for a Viewer that produced no candidates.
-        ({ openedByToggle } = await this.openKViewerQualityMenu(viewer, 360));
+        // Ordinary message single-download must never click Telegram's download/quality UI.
+        // Other callers retain the legacy menu-discovery fallback.
+        if (options.allowNativeFallback !== false) {
+          ({ openedByToggle } = await this.openKViewerQualityMenu(viewer, 360));
+        }
         const observedCandidateCount = firstWait.menu.length + firstWait.viewer.length +
           firstWait.captured.length + firstWait.performance.length;
         const secondWait = await waitForKViewerHttpSource(
-          () => this.readKViewerCandidateSet(viewer, session.viewerOpenRequestAt, openedByToggle),
+          () => this.readKViewerCandidateSet(viewer, session.viewerOpenRequestAt, openedByToggle, session.baselineUrls),
           observedCandidateCount === 0 ? 6500 : 1600,
           100,
           (ms) => sleep(ms).then(() => undefined),
@@ -1188,7 +1863,9 @@ export class TelegramMediaResolver {
         }
         return tryPinCurrentBlob();
       },
-      () => this.triggerKViewerNativeDownload(viewer, original.messageId),
+      () => options.allowNativeFallback === false
+        ? Promise.resolve(false)
+        : this.triggerKViewerNativeDownload(viewer, original.messageId),
       async () => {
         const capturedBlob = latest.captured.find((entry) => entry.url === current?.url);
         const finalBridgeStatus = await this.readPageBridgeStatus(300);
@@ -1216,11 +1893,20 @@ export class TelegramMediaResolver {
             source: entry.source, status: entry.status, contentType: entry.contentType, code: entry.code,
           })),
         };
-        console.error('[TG Downloader][viewer] source unresolved', diagnostics);
-        return Object.assign(new Error('K Viewer 媒体来源未解析；Viewer 已保留，请检查诊断日志'), {
+        const unresolved = Object.assign(new Error('K Viewer 媒体来源未解析；Viewer 已保留，请检查诊断日志'), {
           code: 'K_VIEWER_MEDIA_SOURCE_UNRESOLVED',
           ...diagnostics,
         });
+        console.error(formatErrorLog('[TG Downloader][viewer] source unresolved', unresolved, {
+          messageId: original.messageId,
+          stage: 'viewer-source',
+          qualityMenuCandidates: diagnostics.qualityMenuCandidates,
+          capturedHttpCandidates: diagnostics.capturedHttpCandidates,
+          viewerUrlType: diagnostics.viewerUrlType,
+          objectUrlKind: diagnostics.objectUrlKind,
+          code: unresolved.code,
+        }));
+        return unresolved;
       },
     );
 
@@ -1349,14 +2035,17 @@ export class TelegramMediaResolver {
   }
 
   private readKViewerDomCandidates(viewer: Element): KViewerHttpCandidate[] {
-    return Array.from(viewer.querySelectorAll<HTMLElement>('video, source')).flatMap((node) => {
+    const scope = getActiveViewerMediaScope(viewer);
+    return viewerScopeNodes<HTMLElement>(scope.root, 'video, source').flatMap((node) => {
+      const ownerVideo = node.matches('video') ? node : node.closest('video');
+      if (!scope.ownsCurrentAttachment || (ownerVideo && !visible(ownerVideo))) return [];
       const media = node as HTMLMediaElement;
       const rawUrls = [media.currentSrc, media.src, node.getAttribute('src')].filter(Boolean) as string[];
       const contentType = node.getAttribute('type') || node.getAttribute('data-mime-type') || '';
       return [...new Set(rawUrls)].map((rawUrl) => {
         let url = rawUrl;
         try { url = new URL(rawUrl, window.location.href).href; } catch { /* helper rejects invalid URL */ }
-        return { url, source: 'viewer-element', contentType, trustedMediaElement: true };
+        return { url, source: 'viewer-element', contentType, trustedMediaElement: true, activeViewerMainMedia: true };
       });
     });
   }
@@ -1367,17 +2056,27 @@ export class TelegramMediaResolver {
     return performance.getEntriesByType('resource').flatMap((entry) => {
       const resource = entry as PerformanceResourceTiming;
       if (origin + resource.startTime < since) return [];
-      return [{ url: resource.name, source: 'performance-resource' }];
+      return [{ url: resource.name, source: 'performance-resource', capturedAt: origin + resource.startTime }];
     }).slice(-150);
   }
 
-  private async readKViewerCandidateSet(viewer: Element, since: number, trustedMenu: boolean): Promise<KViewerCandidateSet> {
+  private async readKViewerCandidateSet(
+    viewer: Element,
+    since: number,
+    trustedMenu: boolean,
+    baselineUrls: ReadonlySet<string> = new Set(),
+  ): Promise<KViewerCandidateSet> {
     const [captured] = await Promise.all([this.readRecentPageMediaUrls(since)]);
+    const freshHistorical = (candidates: KViewerHttpCandidate[]) => candidates.filter((candidate) => !baselineUrls.has(candidate.url));
+    const currentMenu = (candidates: KViewerHttpCandidate[]) => candidates.filter((candidate) =>
+      !baselineUrls.has(candidate.url) || candidate.trustedQualityMenu === true);
+    const currentViewer = (candidates: KViewerHttpCandidate[]) => candidates.filter((candidate) =>
+      !baselineUrls.has(candidate.url) || candidate.activeViewerMainMedia === true);
     return {
-      menu: this.readKViewerQualityMenuCandidates(trustedMenu),
-      viewer: this.readKViewerDomCandidates(viewer),
-      captured,
-      performance: this.readPerformanceResourceCandidates(since),
+      menu: currentMenu(this.readKViewerQualityMenuCandidates(trustedMenu)),
+      viewer: currentViewer(this.readKViewerDomCandidates(viewer)),
+      captured: freshHistorical(captured),
+      performance: freshHistorical(this.readPerformanceResourceCandidates(since)),
     };
   }
 
@@ -1658,17 +2357,50 @@ export class TelegramMediaResolver {
     });
   }
 
+  private adoptActiveImageBlob(url: string, messageId: string, attachmentIndex: number): Promise<PinnedViewerBlob> {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve) => {
+      let settled = false;
+      const timeout = window.setTimeout(() => finish({
+        ok: false, requestId, code: 'ACTIVE_IMAGE_BLOB_ADOPT_TIMEOUT', objectUrlKind: 'unknown', cacheState: 'miss',
+        size: 0, mimeType: '', error: '等待当前主图片 Blob 收养响应超时',
+      }), 5000);
+      const finish = (result: PinnedViewerBlob) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        window.removeEventListener('message', onMessage);
+        resolve(result);
+      };
+      const onMessage = (event: MessageEvent) => {
+        if (event.source !== window || event.data?.mark !== PAGE_BRIDGE_MARK ||
+            event.data?.kind !== 'ACTIVE_IMAGE_BLOB_ADOPT_RESULT' || event.data?.requestId !== requestId) return;
+        finish(event.data as PinnedViewerBlob);
+      };
+      window.addEventListener('message', onMessage);
+      try {
+        window.postMessage({ mark: PAGE_BRIDGE_MARK, kind: 'ADOPT_ACTIVE_IMAGE_BLOB', requestId, url }, '*');
+      } catch {
+        finish({
+          ok: false, requestId, code: 'ACTIVE_IMAGE_BLOB_ADOPT_FAILED', objectUrlKind: 'unknown', cacheState: 'miss',
+          size: 0, mimeType: '', error: `无法发送当前主图片 Blob 收养请求 (${messageId}:${attachmentIndex})`,
+        });
+      }
+    });
+  }
+
   private readKViewerMedia(viewer: Element, original: OriginalMediaRecord): OriginalMediaRecord | null {
-    const source = viewer.querySelector('.media-viewer-movers') || viewer.querySelector('.media-viewer-mover.active') ||
-      viewer.querySelector('.media-viewer-mover-wrapper') || viewer;
-    const videos = Array.from(source.querySelectorAll('video')).filter((node) => Boolean(mediaUrl(node)));
+    const scope = getActiveViewerMediaScope(viewer);
+    const videos = viewerScopeNodes(scope.root, 'video').filter((node) => visible(node) && Boolean(mediaUrl(node)));
+    if (!scope.ownsCurrentAttachment && videos.length !== 1) return null;
     if (videos.length) {
       const video = videos[0];
       const url = mediaUrl(video);
       return enrichCapturedMedia({ ...original, id: `${original.messageId}:${url}`, url, kind: 'video' as const, mimeType: video.getAttribute('type') || video.getAttribute('data-mime-type') || 'application/octet-stream' });
     }
-    const images = Array.from(source.querySelectorAll<HTMLImageElement>('img[src]')).filter((node) =>
-      Boolean(mediaUrl(node)) && !node.closest('.spoilers-container, .media-spoiler'));
+    const images = viewerScopeNodes<HTMLImageElement>(scope.root, 'img').filter((node) =>
+      visible(node) && Boolean(mediaUrl(node)) && !node.closest('.spoilers-container, .media-spoiler'));
+    if (!scope.ownsCurrentAttachment && images.length !== 1) return null;
     const candidate = largestViewerImageCandidate(images.map((image) => ({
       image, currentSrc: image.currentSrc, src: image.getAttribute('src') || '',
       naturalWidth: image.naturalWidth, naturalHeight: image.naturalHeight, width: image.width, height: image.height,

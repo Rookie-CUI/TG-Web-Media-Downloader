@@ -61,10 +61,26 @@
       (lower.includes('document') && !lower.includes('videoplay'));
   };
 
+  const mediaUrlType = (url, objectUrlKind) => {
+    if (objectUrlKind === 'media-source') return 'media-source';
+    if (String(url).startsWith('blob:')) return 'blob';
+    const lower = String(url).toLowerCase();
+    if (lower.includes('/progressive/')) return 'progressive';
+    if (lower.includes('/download/')) return 'download';
+    if (lower.includes('/stream/')) return 'stream';
+    return 'http';
+  };
+
   const trackMediaUrl = (url, source, metadata = {}) => {
     if (!isTrackedMediaUrl(url, metadata.contentType || '')) return;
     capturedMediaUrlCount += 1;
-    recentMediaUrls.push({ url, time: Date.now(), source, capturedRealm: 'main-window', ...metadata });
+    recentMediaUrls.push({
+      url, time: Date.now(), source, capturedRealm: 'main-window',
+      urlType: mediaUrlType(url, metadata.objectUrlKind),
+      mime: metadata.contentType || metadata.mimeType || '',
+      blobType: metadata.objectUrlKind || undefined,
+      ...metadata,
+    });
     if (recentMediaUrls.length > 300) recentMediaUrls.splice(0, recentMediaUrls.length - 300);
     publish({ url, source, ...metadata });
   };
@@ -388,6 +404,64 @@
     return result;
   }
 
+  function imageMimeFromSignature(bytes) {
+    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+    if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+        bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return 'image/png';
+    if (bytes.length >= 6 && String.fromCharCode(...bytes.slice(0, 6)) === 'GIF89a') return 'image/gif';
+    if (bytes.length >= 6 && String.fromCharCode(...bytes.slice(0, 6)) === 'GIF87a') return 'image/gif';
+    if (bytes.length >= 12 && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' &&
+        String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP') return 'image/webp';
+    if (bytes.length >= 12 && String.fromCharCode(...bytes.slice(4, 8)) === 'ftyp' &&
+        /^(avif|avis)$/.test(String.fromCharCode(...bytes.slice(8, 12)))) return 'image/avif';
+    return '';
+  }
+
+  async function adoptActiveImageBlob(url, requestId) {
+    const existing = objectUrls.get(url);
+    const history = objectUrlHistory.get(url);
+    const objectUrlKind = existing?.kind || history?.kind || revokedBlobs.get(url) || 'unknown';
+    const fail = (code, error, extra = {}) => ({
+      ok: false, requestId, code, error, objectUrlKind, cacheState: existing ? 'hit' : 'miss',
+      createdAfterBridge: history?.createdAfterBridge ?? null,
+      capturedRealm: history?.capturedRealm || 'unknown',
+      hasObjectReference: Boolean(existing?.kind === 'blob' && existing.blob),
+      size: Number(existing?.blob?.size || 0), mimeType: String(existing?.blob?.type || ''), ...extra,
+    });
+    if (!url.startsWith('blob:')) return fail('ACTIVE_IMAGE_BLOB_URL_INVALID', 'Active image source is not a Blob URL');
+    if (objectUrlKind === 'media-source') return fail('ACTIVE_IMAGE_BLOB_MEDIA_SOURCE_REJECTED', 'MediaSource cannot be adopted as an image');
+    try {
+      const response = await originalFetch.call(window, url);
+      if (!response?.ok) return fail('ACTIVE_IMAGE_BLOB_ADOPT_FAILED', `Active image Blob fetch failed: HTTP ${Number(response?.status) || 0}`);
+      let blob = await response.blob();
+      if (!Number.isSafeInteger(blob.size) || blob.size <= 0) return fail('ACTIVE_IMAGE_BLOB_SIZE_INVALID', 'Active image Blob is empty');
+      let mimeType = String(blob.type || '').split(';', 1)[0].trim().toLowerCase();
+      if (!mimeType.startsWith('image/')) {
+        if (mimeType.startsWith('video/') || mimeType.startsWith('audio/')) {
+          return fail('ACTIVE_IMAGE_BLOB_TYPE_INVALID', 'Video or audio Blob cannot be adopted as an image', { size: blob.size, mimeType });
+        }
+        if (blob.size > 32 * 1024 * 1024) {
+          return fail('ACTIVE_IMAGE_BLOB_UNKNOWN_TOO_LARGE', 'Unknown active image Blob is too large', { size: blob.size, mimeType });
+        }
+        mimeType = imageMimeFromSignature(new Uint8Array(await blob.slice(0, 16).arrayBuffer()));
+        if (!mimeType) return fail('ACTIVE_IMAGE_BLOB_TYPE_INVALID', 'Active image Blob has no verified image type', { size: blob.size });
+        blob = blob.slice(0, blob.size, mimeType);
+      }
+      const adoptedAt = Date.now();
+      const metadata = {
+        kind: 'blob', size: blob.size, mimeType, createdAt: adoptedAt, createdAfterBridge: true,
+        capturedRealm: 'main-window', hasObjectReference: true, revoked: false,
+      };
+      objectUrls.set(url, { kind: 'blob', blob, size: blob.size, mimeType, ...metadata, leases: new Set() });
+      rememberObjectUrl(url, metadata);
+      trimObjectUrls(url);
+      return pinBlob(url, requestId);
+    } catch (error) {
+      const reason = error && typeof error === 'object' && 'message' in error ? String(error.message) : String(error);
+      return fail('ACTIVE_IMAGE_BLOB_ADOPT_FAILED', `Active image Blob adoption failed: ${reason}`);
+    }
+  }
+
   function releaseBlob(url, leaseId, requestId) {
     const entry = objectUrls.get(url);
     if (!entry || !leaseId || !entry.leases.has(leaseId)) {
@@ -617,6 +691,10 @@
     }
     if (kind === 'PIN_BLOB') {
       window.postMessage({ mark: MARK, kind: 'BLOB_PIN_RESULT', ...pinBlob(String(url || ''), requestId) }, '*');
+      return;
+    }
+    if (kind === 'ADOPT_ACTIVE_IMAGE_BLOB') {
+      window.postMessage({ mark: MARK, kind: 'ACTIVE_IMAGE_BLOB_ADOPT_RESULT', ...await adoptActiveImageBlob(String(url || ''), requestId) }, '*');
       return;
     }
     if (kind === 'RELEASE_BLOB') {

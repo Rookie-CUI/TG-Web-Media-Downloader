@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const read = (path) => readFile(fileURLToPath(new URL(path, import.meta.url)), 'utf8');
 
-async function loadModule(path, dependencies = {}) {
+async function loadModule(path, dependencies = {}, globals = {}) {
   const source = await read(path);
   const compiled = ts.transpile(source, { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 });
   const module = { exports: {} };
@@ -15,7 +15,7 @@ async function loadModule(path, dependencies = {}) {
     if (Object.hasOwn(dependencies, name)) return dependencies[name];
     throw new Error(`Unexpected import ${name}`);
   };
-  const context = vm.createContext({ module, exports: module.exports, require, console, URL, WeakMap, Date });
+  const context = vm.createContext({ module, exports: module.exports, require, console, URL, WeakMap, Date, ...globals });
   vm.runInContext(`(function(exports, require, module) { ${compiled}\n})(exports, require, module);`, context);
   return module.exports;
 }
@@ -63,6 +63,33 @@ test('K版 img 缩略图加 video-time 按原版规则分类为 video，并按�
   assert.equal(logs[0][1].hasImg, true);
   assert.equal(logs[0][1].hasVideoTime, true);
   assert.equal(Object.hasOwn(logs[0][1], 'url'), false);
+});
+
+test('K版普通消息 bubble 同时含 img thumbnail 与 video-time 时分类为 video', async () => {
+  const duration = fakeNode({ className: 'video-time', textContent: '00:14' });
+  const attachment = {
+    querySelector(selector) {
+      if (selector.includes('.video-time') || selector.includes('.video-duration')) return duration;
+      if (selector.includes('img.media-photo')) return fakeNode({ tag: 'img', attrs: { src: 'https://cdn.telegram.org/thumb.webp' } });
+      return null;
+    },
+  };
+  const message = {
+    classList: { contains() { return false; } },
+    querySelector(selector) {
+      if (selector.includes('.attachment.media-container')) return attachment;
+      return null;
+    },
+  };
+  const { classifyMessage } = await loadModule('../src/telegram/adapter.ts', {
+    '../utils/filename': { filenameFromUrl: () => 'media.bin', safeFilename: (value) => value },
+    './sidebar-classifier': { classifySidebarMedia: () => null },
+    './captured-media-registry': { rememberCapturedMedia() {} },
+  }, {
+    location: { href: 'https://web.telegram.org/k/' },
+    document: { querySelector() { return null; } },
+  });
+  assert.equal(classifyMessage(message), 'video');
 });
 
 test('img 缩略图带原版 video-play 标记分类为 video', async () => {

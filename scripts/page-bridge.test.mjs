@@ -173,6 +173,43 @@ test('bridge 安装前创建的 Blob URL 不会被伪装为缓存命中或触发
   assert.equal(fetchCount, 0);
 });
 
+test('active image adoption 可从 MAIN world 读取未捕获图片并创建 lease，普通 PIN_BLOB 仍保持严格', async () => {
+  const image = new Blob([Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2])], { type: 'image/png' });
+  const bridge = await loadBridge(async () => ({ ok: true, status: 200, blob: async () => image }));
+  const url = 'blob:https://web.telegram.org/active-image';
+  const strictPin = await bridge.request('PIN_BLOB', url, 'strict-pin-before-adopt');
+  assert.equal(strictPin.ok, false);
+  assert.equal(strictPin.code, 'BLOB_REFERENCE_NOT_CAPTURED');
+
+  const adopted = await bridge.request('ADOPT_ACTIVE_IMAGE_BLOB', url, 'adopt-active-image');
+  assert.equal(adopted.kind, 'ACTIVE_IMAGE_BLOB_ADOPT_RESULT');
+  assert.equal(adopted.ok, true);
+  assert.equal(adopted.objectUrlKind, 'blob');
+  assert.equal(adopted.size, image.size);
+  assert.equal(adopted.mimeType, 'image/png');
+  assert.ok(adopted.leaseId);
+});
+
+test('active image adoption 拒绝空 Blob 和 video Blob', async () => {
+  const emptyBridge = await loadBridge(async () => ({ ok: true, status: 200, blob: async () => new Blob([], { type: 'image/png' }) }));
+  const empty = await emptyBridge.request('ADOPT_ACTIVE_IMAGE_BLOB', 'blob:https://web.telegram.org/empty-image', 'adopt-empty');
+  assert.equal(empty.ok, false);
+  assert.equal(empty.code, 'ACTIVE_IMAGE_BLOB_SIZE_INVALID');
+
+  const videoBridge = await loadBridge(async () => ({ ok: true, status: 200, blob: async () => new Blob([Uint8Array.from([1])], { type: 'video/mp4' }) }));
+  const video = await videoBridge.request('ADOPT_ACTIVE_IMAGE_BLOB', 'blob:https://web.telegram.org/video-poster', 'adopt-video');
+  assert.equal(video.ok, false);
+  assert.equal(video.code, 'ACTIVE_IMAGE_BLOB_TYPE_INVALID');
+});
+
+test('active image adoption fetch 失败返回明确错误且不伪造 lease', async () => {
+  const bridge = await loadBridge(async () => { throw new TypeError('Failed to fetch'); });
+  const result = await bridge.request('ADOPT_ACTIVE_IMAGE_BLOB', 'blob:https://web.telegram.org/missing-image', 'adopt-failed');
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'ACTIVE_IMAGE_BLOB_ADOPT_FAILED');
+  assert.equal(result.leaseId, undefined);
+});
+
 test('BLOB_META 缓存未命中时通过页面 fetch(blobUrl) 回退并缓存结果', async () => {
   const fallback = new Blob([Uint8Array.from([5, 6, 7])], { type: 'image/webp' });
   const fetched = [];
@@ -262,8 +299,8 @@ test('页面 fetch 捕获本轮 Viewer 的 Telegram 视频 HTTP 地址和响应 
   const result = bridge.getRecentMediaUrls(Date.now() - 1000, 'viewer-capture');
   assert.equal(result.type, 'TG_DOWNLOADER_MEDIA_URLS_RESPONSE');
   assert.equal(result.requestId, 'viewer-capture');
-  assert.deepEqual(JSON.parse(JSON.stringify(result.items.map(({ url, contentType, source }) => ({ url, contentType, source })))), [
-    { url: mediaUrl, contentType: 'video/mp4', source: 'fetch' },
+  assert.deepEqual(JSON.parse(JSON.stringify(result.items.map(({ url, contentType, source, urlType, mime }) => ({ url, contentType, source, urlType, mime })))), [
+    { url: mediaUrl, contentType: 'video/mp4', source: 'fetch', urlType: 'http', mime: 'video/mp4' },
   ]);
 });
 
@@ -286,6 +323,10 @@ test('真实零字节 Blob 元数据返回 size=0，由 Downloader 决定失败'
   assert.equal(response.kind, 'BLOB_META');
   assert.equal(response.total, 0);
   assert.equal(response.mimeType, 'video/mp4');
+  const tracked = bridge.getRecentMediaUrls(Date.now() - 1000, 'blob-candidate').items.find((candidate) => candidate.url === url);
+  assert.equal(tracked.urlType, 'blob');
+  assert.equal(tracked.blobType, 'blob');
+  assert.equal(tracked.mime, 'video/mp4');
 });
 
 test('页面 HTTP bridge 使用 credentials 并显式 follow Telegram progressive 重定向，返回最终 206 元数据', async () => {
